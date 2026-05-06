@@ -1,74 +1,61 @@
-"""Tracks cron job execution state and detects missed or slow runs."""
+"""Tracker: records job run start/finish times and exposes run history."""
 
-import time
-from dataclasses import dataclass, field
-from typing import Optional
-
-from cronwatch.schedule import CronSchedule
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
 
 
-@dataclass
 class JobRun:
-    """Records a single execution of a cron job."""
-    started_at: float
-    finished_at: Optional[float] = None
+    """Represents a single execution of a cron job."""
+
+    def __init__(self, run_id: str, started_at: datetime) -> None:
+        self.run_id = run_id
+        self.started_at = started_at
+        self.finished_at: Optional[datetime] = None
 
     @property
     def duration(self) -> Optional[float]:
+        """Return elapsed seconds, or None if still running."""
         if self.finished_at is None:
             return None
-        return self.finished_at - self.started_at
+        return (self.finished_at - self.started_at).total_seconds()
 
     @property
     def is_running(self) -> bool:
         return self.finished_at is None
 
 
-@dataclass
 class JobTracker:
-    """Tracks execution state for a single named cron job."""
-    name: str
-    schedule: CronSchedule
-    timeout_seconds: float = 300.0
-    history: list = field(default_factory=list)
-    _current_run: Optional[JobRun] = field(default=None, repr=False)
+    """Tracks multiple runs for a single job."""
 
-    def record_start(self, timestamp: Optional[float] = None) -> JobRun:
-        """Record that the job has started."""
-        ts = timestamp if timestamp is not None else time.time()
-        run = JobRun(started_at=ts)
-        self._current_run = run
-        self.history.append(run)
+    def __init__(self) -> None:
+        self._runs: Dict[str, JobRun] = {}
+        self._order: List[str] = []
+
+    def record_start(self, run_id: str, at: Optional[datetime] = None) -> JobRun:
+        ts = at or datetime.now(timezone.utc)
+        run = JobRun(run_id, ts)
+        self._runs[run_id] = run
+        self._order.append(run_id)
         return run
 
-    def record_finish(self, timestamp: Optional[float] = None) -> Optional[JobRun]:
-        """Record that the current job run has finished."""
-        if self._current_run is None:
+    def record_finish(self, run_id: str, at: Optional[datetime] = None) -> Optional[JobRun]:
+        run = self._runs.get(run_id)
+        if run is None:
             return None
-        ts = timestamp if timestamp is not None else time.time()
-        self._current_run.finished_at = ts
-        run = self._current_run
-        self._current_run = None
+        run.finished_at = at or datetime.now(timezone.utc)
         return run
 
-    def is_missed(self, reference_time: Optional[float] = None) -> bool:
-        """Return True if a scheduled run appears to have been missed."""
-        now = reference_time if reference_time is not None else time.time()
-        expected = self.schedule.next_run(before=now)
-        if expected is None:
-            return False
-        if not self.history:
-            return True
-        last_start = self.history[-1].started_at
-        return last_start < expected
+    def get_run(self, run_id: str) -> Optional[JobRun]:
+        return self._runs.get(run_id)
 
-    def is_slow(self) -> bool:
-        """Return True if the current run has exceeded the timeout threshold."""
-        if self._current_run is None:
-            return False
-        elapsed = time.time() - self._current_run.started_at
-        return elapsed > self.timeout_seconds
+    def all_runs(self) -> List[JobRun]:
+        return [self._runs[rid] for rid in self._order]
 
-    @property
-    def last_run(self) -> Optional[JobRun]:
-        return self.history[-1] if self.history else None
+    def last_start_time(self) -> Optional[datetime]:
+        if not self._order:
+            return None
+        return self._runs[self._order[-1]].started_at
+
+    def has_run_started_after(self, ts: datetime) -> bool:
+        """Return True if any run started at or after *ts*."""
+        return any(r.started_at >= ts for r in self._runs.values())

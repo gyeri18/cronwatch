@@ -1,75 +1,66 @@
-"""Configuration loader for cronwatch.
-
-Supports YAML config files defining jobs to watch, alert thresholds,
-and notifier settings.
-"""
+"""Configuration loading and validation for cronwatch."""
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
-from typing import Any
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-try:
-    import yaml
-except ImportError:  # pragma: no cover
-    yaml = None  # type: ignore
+import yaml
+
+
+@dataclass
+class NotifierConfig:
+    kind: str
+    url: Optional[str] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class JobConfig:
     name: str
     schedule: str
-    timeout: int = 300          # seconds before a running job is considered slow
-    grace: int = 60             # seconds after expected start before "missed" alert
-    tags: list[str] = field(default_factory=list)
-
-
-@dataclass
-class NotifierConfig:
-    kind: str                   # "log", "print", or "webhook"
-    url: str | None = None      # for webhook
-    level: str = "WARNING"      # for log notifier
+    timeout: int
+    grace: int = 0
 
 
 @dataclass
 class CronwatchConfig:
-    jobs: list[JobConfig] = field(default_factory=list)
-    notifiers: list[NotifierConfig] = field(default_factory=list)
+    jobs: List[JobConfig]
+    notifiers: List[NotifierConfig]
+
+    @classmethod
+    def from_file(cls, path: Path) -> "CronwatchConfig":
+        with path.open() as fh:
+            data = yaml.safe_load(fh)
+        return cls(
+            jobs=[_parse_job(j) for j in data.get("jobs", [])],
+            notifiers=[_parse_notifier(n) for n in data.get("notifiers", [])],
+        )
 
 
-def _parse_job(raw: dict[str, Any]) -> JobConfig:
-    if "name" not in raw:
-        raise ValueError("Each job entry must have a 'name' field.")
-    if "schedule" not in raw:
-        raise ValueError(f"Job '{raw['name']}' is missing a 'schedule' field.")
+def _parse_job(data: Dict[str, Any]) -> JobConfig:
+    if "name" not in data:
+        raise ValueError("Job entry missing required field 'name'")
+    if "schedule" not in data:
+        raise ValueError("Job entry missing required field 'schedule'")
+    if "timeout" not in data:
+        raise ValueError("Job entry missing required field 'timeout'")
     return JobConfig(
-        name=raw["name"],
-        schedule=raw["schedule"],
-        timeout=int(raw.get("timeout", 300)),
-        grace=int(raw.get("grace", 60)),
-        tags=list(raw.get("tags", [])),
+        name=data["name"],
+        schedule=data["schedule"],
+        timeout=int(data["timeout"]),
+        grace=int(data.get("grace", 0)),
     )
 
 
-def _parse_notifier(raw: dict[str, Any]) -> NotifierConfig:
-    if "kind" not in raw:
-        raise ValueError("Each notifier entry must have a 'kind' field.")
+def _parse_notifier(data: Dict[str, Any]) -> NotifierConfig:
+    if "kind" not in data:
+        raise ValueError("Notifier entry missing required field 'kind'")
+    known = {"url"}
+    extra = {k: v for k, v in data.items() if k not in known | {"kind"}}
     return NotifierConfig(
-        kind=raw["kind"],
-        url=raw.get("url"),
-        level=raw.get("level", "WARNING"),
+        kind=data["kind"],
+        url=data.get("url"),
+        extra=extra,
     )
-
-
-def load_config(path: str) -> CronwatchConfig:
-    """Load a YAML config file and return a CronwatchConfig."""
-    if yaml is None:
-        raise RuntimeError("PyYAML is required to load config files. Install it with: pip install pyyaml")
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Config file not found: {path}")
-    with open(path, "r") as fh:
-        raw = yaml.safe_load(fh) or {}
-    jobs = [_parse_job(j) for j in raw.get("jobs", [])]
-    notifiers = [_parse_notifier(n) for n in raw.get("notifiers", [])]
-    return CronwatchConfig(jobs=jobs, notifiers=notifiers)

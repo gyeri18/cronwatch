@@ -1,75 +1,93 @@
-"""Alert dispatching with optional throttling support."""
+"""Alert data-class and dispatcher with optional retry support."""
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
-from cronwatch.throttle import AlertThrottle
+from cronwatch.retry import RetryPolicy, with_retry
+
+log = logging.getLogger(__name__)
+
+Handler = Callable[["Alert"], None]
 
 
 @dataclass
 class Alert:
-    kind: str          # e.g. "missed", "slow", "recovered"
+    """A single alert event."""
+
+    kind: str          # e.g. "missed", "slow", "error"
     job_name: str
     message: str
+    extra: dict = field(default_factory=dict)
 
     def __str__(self) -> str:
         return f"[{self.kind.upper()}] {self.job_name}: {self.message}"
 
 
-Handler = Callable[[Alert], None]
-
-
 class Alerter:
-    """Dispatches alerts to registered handlers.
+    """Dispatches :class:`Alert` objects to registered handlers.
 
-    Optionally wraps dispatch with an :class:`AlertThrottle` so that
-    repeated alerts for the same (kind, job) pair are suppressed until
-    the configured cool-down period has elapsed.
+    Each handler is called with the alert.  If *retry_policy* is provided,
+    failed handler calls are retried according to that policy.
     """
 
     def __init__(
         self,
-        throttle: Optional[AlertThrottle] = None,
+        retry_policy: Optional[RetryPolicy] = None,
     ) -> None:
         self._handlers: List[Handler] = []
-        self._throttle = throttle
-        self.sent_count: int = 0
-        self.suppressed_count: int = 0
+        self._retry_policy = retry_policy or RetryPolicy(max_attempts=1)
+
+    # ------------------------------------------------------------------
+    # Registration
+    # ------------------------------------------------------------------
 
     def add_handler(self, handler: Handler) -> None:
-        """Register a callable that receives :class:`Alert` objects."""
+        """Register *handler* to receive future alerts."""
         self._handlers.append(handler)
 
-    def send(self, alert: Alert) -> bool:
-        """Dispatch *alert* to all handlers.
+    def remove_handler(self, handler: Handler) -> None:
+        """Unregister *handler* (no-op if not present)."""
+        try:
+            self._handlers.remove(handler)
+        except ValueError:
+            pass
 
-        Returns True if the alert was dispatched, False if throttled.
-        """
-        if self._throttle is not None:
-            if not self._throttle.allow(alert.kind, alert.job_name):
-                self.suppressed_count += 1
-                return False
+    # ------------------------------------------------------------------
+    # Dispatch
+    # ------------------------------------------------------------------
 
-        for handler in self._handlers:
-            try:
-                handler(alert)
-            except Exception:  # noqa: BLE001
-                pass
+    def send(self, alert: Alert) -> None:
+        """Deliver *alert* to every registered handler."""
+        for handler in list(self._handlers):
+            self._deliver(handler, alert)
 
-        self.sent_count += 1
-        return True
+    def _deliver(self, handler: Handler, alert: Alert) -> None:
+        policy = self._retry_policy
 
-    def alert_missed(self, job_name: str, message: str = "Job did not run") -> bool:
-        return self.send(Alert(kind="missed", job_name=job_name, message=message))
+        def attempt() -> None:
+            handler(alert)
 
-    def alert_slow(self, job_name: str, message: str = "Job exceeded time limit") -> bool:
-        return self.send(Alert(kind="slow", job_name=job_name, message=message))
+        state = with_retry(attempt, policy)
+        if not state.succeeded:
+            log.error(
+                "Handler %r failed after %d attempt(s): %s",
+                handler,
+                state.attempts,
+                state.last_error,
+            )
 
-    def alert_recovered(self, job_name: str, message: str = "Job is running again") -> bool:
-        return self.send(Alert(kind="recovered", job_name=job_name, message=message))
+    # ------------------------------------------------------------------
+    # Convenience factories
+    # ------------------------------------------------------------------
 
-    @property
-    def handler_count(self) -> int:
-        return len(self._handlers)
+    def missed(self, job_name: str, message: str, **extra) -> None:
+        self.send(Alert(kind="missed", job_name=job_name, message=message, extra=extra))
+
+    def slow(self, job_name: str, message: str, **extra) -> None:
+        self.send(Alert(kind="slow", job_name=job_name, message=message, extra=extra))
+
+    def error(self, job_name: str, message: str, **extra) -> None:
+        self.send(Alert(kind="error", job_name=job_name, message=message, extra=extra))

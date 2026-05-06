@@ -1,0 +1,31 @@
+# cronwatch example configuration
+# Copy to config.yaml and adjust to your environment.
+
+jobs:
+  - name: daily-backup
+    schedule: "0 2 * * *"   # every day at 02:00
+    timeout: 3600            # alert if still running after 1 hour
+    grace: 120               # allow 2-minute late start
+    tags:
+      - backup
+      - critical
+
+  - name: hourly-sync
+    schedule: "0 * * * *"   # every hour on the hour
+    timeout: 300
+    grace: 60
+
+  - name: weekly-report
+    schedule: "30 8 * * 1"  # every Monday at 08:30
+    timeout: 1800
+    grace: 300
+    tags:
+      - reports
+
+notifiers:
+  - kind: log
+    level: WARNING
+
+  # Uncomment to also send alerts to a webhook (e.g. Slack incoming webhook):
+  # - kind: webhook
+  #   url: https://hooks.slack.com/services/XXX/YYY/ZZZ

@@ -1,90 +1,120 @@
-"""Tests for cronwatch.alerter."""
+"""Tests for cronwatch.alerter (including throttle integration)."""
 
-from datetime import datetime, timedelta
-from unittest.mock import MagicMock
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from cronwatch.alerter import Alert, Alerter
+from cronwatch.throttle import AlertThrottle
 
 
 @pytest.fixture()
 def alerter() -> Alerter:
-    return Alerter(slow_threshold=timedelta(minutes=5))
+    return Alerter()
 
+
+# ---------------------------------------------------------------------------
+# Alert dataclass
+# ---------------------------------------------------------------------------
 
 class TestAlert:
     def test_str_contains_kind_and_job(self):
-        a = Alert(job_name="backup", kind="missed", message="too late")
-        text = str(a)
-        assert "MISSED" in text
-        assert "backup" in text
-        assert "too late" in text
+        a = Alert(kind="missed", job_name="backup", message="not run")
+        assert "MISSED" in str(a)
+        assert "backup" in str(a)
 
+    def test_str_contains_message(self):
+        a = Alert(kind="slow", job_name="etl", message="too slow")
+        assert "too slow" in str(a)
+
+
+# ---------------------------------------------------------------------------
+# Alerter handler management
+# ---------------------------------------------------------------------------
 
 class TestAlerterHandlers:
     def test_handler_called_on_alert(self, alerter):
         handler = MagicMock()
         alerter.add_handler(handler)
-        alerter.check_failed("myjob", exit_code=1)
+        alerter.send(Alert("missed", "backup", "msg"))
         handler.assert_called_once()
-        alert = handler.call_args[0][0]
-        assert isinstance(alert, Alert)
-        assert alert.kind == "failed"
 
     def test_multiple_handlers_all_called(self, alerter):
         h1, h2 = MagicMock(), MagicMock()
         alerter.add_handler(h1)
         alerter.add_handler(h2)
-        alerter.check_failed("job", exit_code=2)
+        alerter.send(Alert("missed", "backup", "msg"))
         h1.assert_called_once()
         h2.assert_called_once()
 
-    def test_alert_stored_in_history(self, alerter):
-        alerter.check_failed("job", exit_code=1)
-        assert len(alerter.history) == 1
-        assert alerter.history[0].kind == "failed"
+    def test_handler_count(self, alerter):
+        alerter.add_handler(MagicMock())
+        alerter.add_handler(MagicMock())
+        assert alerter.handler_count == 2
+
+    def test_faulty_handler_does_not_raise(self, alerter):
+        alerter.add_handler(lambda a: (_ for _ in ()).throw(RuntimeError("boom")))
+        alerter.send(Alert("missed", "backup", "msg"))  # should not raise
+
+    def test_sent_count_increments(self, alerter):
+        alerter.add_handler(MagicMock())
+        alerter.send(Alert("missed", "backup", "m"))
+        alerter.send(Alert("slow", "etl", "m"))
+        assert alerter.sent_count == 2
 
 
-class TestCheckFailed:
-    def test_zero_exit_code_no_alert(self, alerter):
-        assert alerter.check_failed("job", 0) is False
-        assert alerter.history == []
+# ---------------------------------------------------------------------------
+# Convenience helpers
+# ---------------------------------------------------------------------------
 
-    def test_nonzero_exit_code_fires_alert(self, alerter):
-        assert alerter.check_failed("job", 1) is True
-        assert alerter.history[0].job_name == "job"
+class TestAlerterHelpers:
+    def test_alert_missed_dispatches(self, alerter):
+        h = MagicMock()
+        alerter.add_handler(h)
+        result = alerter.alert_missed("backup")
+        assert result is True
+        assert h.call_args[0][0].kind == "missed"
+
+    def test_alert_slow_dispatches(self, alerter):
+        h = MagicMock()
+        alerter.add_handler(h)
+        alerter.alert_slow("etl")
+        assert h.call_args[0][0].kind == "slow"
+
+    def test_alert_recovered_dispatches(self, alerter):
+        h = MagicMock()
+        alerter.add_handler(h)
+        alerter.alert_recovered("etl")
+        assert h.call_args[0][0].kind == "recovered"
 
 
-class TestCheckSlow:
-    def test_under_threshold_no_alert(self, alerter):
-        assert alerter.check_slow("job", timedelta(minutes=3)) is False
-        assert alerter.history == []
+# ---------------------------------------------------------------------------
+# Throttle integration
+# ---------------------------------------------------------------------------
 
-    def test_over_threshold_fires_alert(self, alerter):
-        assert alerter.check_slow("job", timedelta(minutes=10)) is True
-        assert alerter.history[0].kind == "slow"
+class TestAlerterThrottle:
+    def test_throttled_alert_returns_false(self):
+        throttle = AlertThrottle(default_interval_seconds=9999)
+        a = Alerter(throttle=throttle)
+        a.add_handler(MagicMock())
+        a.send(Alert("missed", "backup", "first"))
+        result = a.send(Alert("missed", "backup", "second"))
+        assert result is False
 
-    def test_alert_message_contains_duration(self, alerter):
-        alerter.check_slow("job", timedelta(minutes=10))
-        assert "0:10:00" in alerter.history[0].message
+    def test_suppressed_count_increments(self):
+        throttle = AlertThrottle(default_interval_seconds=9999)
+        a = Alerter(throttle=throttle)
+        a.send(Alert("missed", "backup", "first"))
+        a.send(Alert("missed", "backup", "second"))
+        a.send(Alert("missed", "backup", "third"))
+        assert a.suppressed_count == 2
 
-
-class TestCheckMissed:
-    def test_future_expected_no_alert(self, alerter):
-        future = datetime.utcnow() + timedelta(hours=1)
-        assert alerter.check_missed("job", expected_at=future) is False
-        assert alerter.history == []
-
-    def test_past_expected_fires_alert(self, alerter):
-        past = datetime.utcnow() - timedelta(hours=1)
-        assert alerter.check_missed("job", expected_at=past) is True
-        assert alerter.history[0].kind == "missed"
-
-    def test_within_grace_no_alert(self, alerter):
-        # just missed but within grace
-        slightly_past = datetime.utcnow() - timedelta(seconds=10)
-        assert (
-            alerter.check_missed("job", slightly_past, grace=timedelta(minutes=5))
-            is False
-        )
+    def test_no_throttle_always_sends(self):
+        a = Alerter(throttle=None)
+        h = MagicMock()
+        a.add_handler(h)
+        for _ in range(5):
+            a.send(Alert("missed", "backup", "msg"))
+        assert h.call_count == 5

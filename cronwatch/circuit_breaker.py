@@ -49,6 +49,19 @@ class CircuitBreaker:
                 self._state = State.HALF_OPEN
         return self._state
 
+    @property
+    def seconds_until_retry(self) -> Optional[float]:
+        """Return seconds remaining before the breaker moves to HALF_OPEN.
+
+        Returns ``None`` when the circuit is not OPEN or the timer has already
+        elapsed (i.e. the transition to HALF_OPEN will happen on the next
+        :pymeth:`state` access).
+        """
+        if self._state is not State.OPEN or self._opened_at is None:
+            return None
+        remaining = self.recovery_timeout - (_now() - self._opened_at)
+        return max(remaining, 0.0) if remaining > 0 else None
+
     def allow_request(self) -> bool:
         """Return True if the caller is permitted to attempt the operation."""
         return self.state in (State.CLOSED, State.HALF_OPEN)

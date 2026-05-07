@@ -1,128 +1,148 @@
-"""Tests for cronwatch.audit and cronwatch.alerter_audited."""
+"""Tests for cronwatch/audit.py — AuditEntry and AuditLog."""
 
 from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
-from cronwatch.alerter import Alert, Alerter
-from cronwatch.alerter_audited import AuditedAlerter
+from cronwatch.alerter import Alert
 from cronwatch.audit import AuditEntry, AuditLog
 
-_T0 = datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+FIXED_TS = datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
 
 
-def _alert(job="backup", kind="missed", message="Job missed", extra=None):
-    return Alert(job=job, kind=kind, message=message, extra=extra or {})
+def _alert(job: str = "backup", kind: str = "missed") -> Alert:
+    return Alert(job=job, kind=kind, message=f"{kind} alert for {job}")
 
 
 # ---------------------------------------------------------------------------
-# AuditEntry
+# AuditEntry tests
 # ---------------------------------------------------------------------------
+
 
 class TestAuditEntry:
     def test_to_dict_roundtrip(self):
-        entry = AuditEntry(
-            timestamp=_T0, job="backup", kind="missed",
-            message="Job missed", extra={"threshold": 5}
-        )
-        restored = AuditEntry.from_dict(entry.to_dict())
-        assert restored.job == entry.job
-        assert restored.kind == entry.kind
-        assert restored.message == entry.message
-        assert restored.extra == entry.extra
+        alert = _alert()
+        entry = AuditEntry(timestamp=FIXED_TS, alert=alert, handler="log_handler")
+        d = entry.to_dict()
+        restored = AuditEntry.from_dict(d)
+        assert restored.handler == entry.handler
+        assert restored.alert.job == entry.alert.job
+        assert restored.alert.kind == entry.alert.kind
         assert restored.timestamp == entry.timestamp
 
     def test_to_dict_has_iso_timestamp(self):
-        entry = AuditEntry(timestamp=_T0, job="j", kind="k", message="m")
-        assert entry.to_dict()["timestamp"] == _T0.isoformat()
+        alert = _alert()
+        entry = AuditEntry(timestamp=FIXED_TS, alert=alert, handler="print_handler")
+        d = entry.to_dict()
+        assert d["timestamp"] == "2024-06-01T12:00:00+00:00"
+
+    def test_to_dict_contains_handler(self):
+        alert = _alert()
+        entry = AuditEntry(timestamp=FIXED_TS, alert=alert, handler="webhook")
+        assert entry.to_dict()["handler"] == "webhook"
+
+    def test_to_dict_contains_job_and_kind(self):
+        alert = _alert(job="deploy", kind="slow")
+        entry = AuditEntry(timestamp=FIXED_TS, alert=alert, handler="log_handler")
+        d = entry.to_dict()
+        assert d["job"] == "deploy"
+        assert d["kind"] == "slow"
+
+    def test_from_dict_creates_entry(self):
+        data = {
+            "timestamp": "2024-06-01T12:00:00+00:00",
+            "job": "backup",
+            "kind": "missed",
+            "message": "missed alert for backup",
+            "handler": "log_handler",
+        }
+        entry = AuditEntry.from_dict(data)
+        assert entry.alert.job == "backup"
+        assert entry.alert.kind == "missed"
+        assert entry.handler == "log_handler"
+        assert entry.timestamp == FIXED_TS
 
 
 # ---------------------------------------------------------------------------
-# AuditLog
+# AuditLog tests
 # ---------------------------------------------------------------------------
+
 
 class TestAuditLog:
-    def test_record_stores_entry(self):
+    def test_record_appends_entry(self):
         log = AuditLog()
         alert = _alert()
-        log.record(alert, clock=lambda: _T0)
+        with patch("cronwatch.audit._utcnow", return_value=FIXED_TS):
+            log.record(alert=alert, handler="log_handler")
+        assert len(log) == 1
+
+    def test_record_multiple_entries(self):
+        log = AuditLog()
+        with patch("cronwatch.audit._utcnow", return_value=FIXED_TS):
+            log.record(alert=_alert("job1"), handler="h1")
+            log.record(alert=_alert("job2"), handler="h2")
+        assert len(log) == 2
+
+    def test_entries_returns_copy(self):
+        log = AuditLog()
+        with patch("cronwatch.audit._utcnow", return_value=FIXED_TS):
+            log.record(alert=_alert(), handler="log_handler")
         entries = log.entries()
-        assert len(entries) == 1
-        assert entries[0].job == "backup"
-        assert entries[0].kind == "missed"
+        entries.clear()
+        assert len(log) == 1
 
     def test_filter_by_job(self):
         log = AuditLog()
-        log.record(_alert(job="backup"), clock=lambda: _T0)
-        log.record(_alert(job="sync"), clock=lambda: _T0)
-        assert len(log.entries(job="backup")) == 1
-        assert len(log.entries(job="sync")) == 1
+        with patch("cronwatch.audit._utcnow", return_value=FIXED_TS):
+            log.record(alert=_alert("backup"), handler="h")
+            log.record(alert=_alert("deploy"), handler="h")
+        results = log.filter(job="backup")
+        assert len(results) == 1
+        assert results[0].alert.job == "backup"
 
-    def test_max_entries_respected(self):
-        log = AuditLog(max_entries=3)
-        for _ in range(5):
-            log.record(_alert(), clock=lambda: _T0)
-        assert len(log.entries()) == 3
-
-    def test_clear_removes_all(self):
+    def test_filter_by_kind(self):
         log = AuditLog()
-        log.record(_alert(), clock=lambda: _T0)
+        with patch("cronwatch.audit._utcnow", return_value=FIXED_TS):
+            log.record(alert=_alert(kind="missed"), handler="h")
+            log.record(alert=_alert(kind="slow"), handler="h")
+        results = log.filter(kind="slow")
+        assert len(results) == 1
+        assert results[0].alert.kind == "slow"
+
+    def test_to_jsonable_is_list_of_dicts(self):
+        log = AuditLog()
+        with patch("cronwatch.audit._utcnow", return_value=FIXED_TS):
+            log.record(alert=_alert(), handler="log_handler")
+        data = log.to_jsonable()
+        assert isinstance(data, list)
+        assert isinstance(data[0], dict)
+        # Verify it is JSON-serialisable
+        json.dumps(data)
+
+    def test_clear_empties_log(self):
+        log = AuditLog()
+        with patch("cronwatch.audit._utcnow", return_value=FIXED_TS):
+            log.record(alert=_alert(), handler="log_handler")
         log.clear()
-        assert log.entries() == []
+        assert len(log) == 0
 
-    def test_persists_to_file(self, tmp_path):
-        p = tmp_path / "audit.jsonl"
-        log = AuditLog(path=p)
-        log.record(_alert(), clock=lambda: _T0)
-        lines = p.read_text().strip().splitlines()
-        assert len(lines) == 1
-        data = json.loads(lines[0])
-        assert data["job"] == "backup"
-
-    def test_loads_existing_file(self, tmp_path):
-        p = tmp_path / "audit.jsonl"
-        entry = AuditEntry(timestamp=_T0, job="x", kind="slow", message="slow")
-        p.write_text(json.dumps(entry.to_dict()) + "\n")
-        log = AuditLog(path=p)
-        assert len(log.entries()) == 1
-        assert log.entries()[0].job == "x"
-
-
-# ---------------------------------------------------------------------------
-# AuditedAlerter
-# ---------------------------------------------------------------------------
-
-class TestAuditedAlerter:
-    def test_send_records_in_audit_log(self):
-        base = Alerter()
-        log = AuditLog()
-        audited = AuditedAlerter(base, log)
-        audited.send(_alert())
-        assert len(log.entries()) == 1
-
-    def test_send_dispatches_to_handlers(self):
-        received: list = []
-        base = Alerter()
-        base.add_handler(received.append)
-        log = AuditLog()
-        audited = AuditedAlerter(base, log)
-        audited.send(_alert())
-        assert len(received) == 1
-
-    def test_add_handler_delegates(self):
-        received: list = []
-        base = Alerter()
-        log = AuditLog()
-        audited = AuditedAlerter(base, log)
-        audited.add_handler(received.append)
-        audited.send(_alert())
-        assert len(received) == 1
-
-    def test_audit_log_property(self):
-        log = AuditLog()
-        audited = AuditedAlerter(Alerter(), log)
-        assert audited.audit_log is log
+    def test_max_size_evicts_oldest(self):
+        log = AuditLog(max_size=2)
+        with patch("cronwatch.audit._utcnow", return_value=FIXED_TS):
+            log.record(alert=_alert("a"), handler="h")
+            log.record(alert=_alert("b"), handler="h")
+            log.record(alert=_alert("c"), handler="h")
+        assert len(log) == 2
+        jobs = [e.alert.job for e in log.entries()]
+        assert "a" not in jobs
+        assert "b" in jobs
+        assert "c" in jobs
